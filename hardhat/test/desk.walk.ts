@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { network } from "hardhat";
 import { getAddress, parseEther, stringToHex } from "viem";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 const SCHEDULER = "0x56e776BAE2DD60664b69Bd5F865F1180ffB7D58B" as const;
 const PURSE = "0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948" as const;
@@ -14,13 +15,23 @@ describe("desk walk", async function () {
   const { viem, networkHelpers } = await network.create();
   const publicClient = await viem.getPublicClient();
   const testClient = await viem.getTestClient();
-  const [, kay, leo] = await viem.getWalletClients();
+
+  const kayAcct = privateKeyToAccount(generatePrivateKey());
+  const leoAcct = privateKeyToAccount(generatePrivateKey());
+  await testClient.setBalance({ address: kayAcct.address, value: parseEther("100") });
+  await testClient.setBalance({ address: leoAcct.address, value: parseEther("100") });
+
+  const kay = await viem.getWalletClient(kayAcct);
+  const leo = await viem.getWalletClient(leoAcct);
+  assert.ok(kay && leo, "hardhat did not return wallet clients for the ticket buyers");
 
   async function paint(name: string, address: `0x${string}`) {
     const d = await viem.deployContract(name);
     const code = await publicClient.getCode({ address: d.address });
-    assert.ok(code && code !== "0x");
+    assert.ok(code && code !== "0x", `no bytecode for ${name}`);
     await testClient.setCode({ address, bytecode: code });
+    const etched = await publicClient.getCode({ address });
+    assert.ok(etched && etched !== "0x", `setCode failed for ${name} at ${address}`);
     return viem.getContractAt(name, address);
   }
 
@@ -54,7 +65,7 @@ describe("desk walk", async function () {
   } as const;
 
   it("clears the book: yes tickets take the full pool", async function () {
-    const { desk, scheduler } = await networkHelpers.loadFixture(world);
+    const { desk, scheduler } = await world();
     await desk.write.createMarket([spec]);
     const id = await desk.read.marketCount();
     await desk.write.bet([id, true], { account: kay.account, value: parseEther("3") });
@@ -63,7 +74,7 @@ describe("desk walk", async function () {
     await mineTo(row.resolveBlock);
     await scheduler.write.kick([row.scheduleId, 0n]);
     const done = await desk.read.getMarket([id]);
-    assert.equal(done.state, 3);
+    assert.equal(done.state, 3, `expected SETTLED, got state=${done.state} outcome=${done.outcome} reason=${done.invalidReason}`);
     assert.equal(done.outcome, 1);
     assert.equal(done.observedValue, 4100n);
     const before = await publicClient.getBalance({ address: kay.account.address });
@@ -74,7 +85,7 @@ describe("desk walk", async function () {
   });
 
   it("voids the book after three feed misses and returns tickets", async function () {
-    const { desk, scheduler, http } = await networkHelpers.loadFixture(world);
+    const { desk, scheduler, http } = await world();
     await http.write.jam([true]);
     await desk.write.createMarket([spec]);
     const id = await desk.read.marketCount();
@@ -85,7 +96,7 @@ describe("desk walk", async function () {
     await scheduler.write.kick([row.scheduleId, 1n]);
     await scheduler.write.kick([row.scheduleId, 2n]);
     const voided = await desk.read.getMarket([id]);
-    assert.equal(voided.state, 4);
+    assert.equal(voided.state, 4, `expected VOID, got state=${voided.state} outcome=${voided.outcome} attempts=${voided.attempts}`);
     assert.equal(voided.outcome, 0);
     const before = await publicClient.getBalance({ address: kay.account.address });
     const hash = await desk.write.claimRefund([id], { account: kay.account });
