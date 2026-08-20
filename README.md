@@ -1,13 +1,12 @@
-# Ritual Predict
+# The Desk
 
-A self-resolving binary prediction market on [Ritual Chain](https://docs.ritualfoundation.org).
+A betting **desk** on [Ritual Chain](https://docs.ritualfoundation.org): you file a market, people
+buy YES/NO tickets, and the **Scheduler** files the close. No night editor. No cron.
 
-Create a market like _"Will ETH/USD be at least $4,000 when this market resolves?"_, stake native
-RITUAL on YES or NO, and watch it settle itself. When the betting window closes, **nobody presses a
-resolve button and no backend cron job runs**. The Ritual Scheduler wakes the contract at a block
-fixed when the market was created; the contract calls the HTTP precompile to read the configured
-oracle URL, extracts one number with the jq precompile, compares it to the target, and settles.
-Winners then pull their proportional share of the pool.
+Feed: HTTP `0x0801` + jq `0x0803`. A dead wire is never a NO — three misses **void** the book.
+
+Paper UI lives in `web/` (masthead "The Desk"). Wiring notes in [DESIGN.md](./DESIGN.md). How I
+checked it: [CHECKS.md](./CHECKS.md). The snag I hit: [NOTE.md](./NOTE.md).
 
 ---
 
@@ -85,12 +84,17 @@ takes their stake back.
 - Node.js 20+ and `pnpm`
 - A wallet with testnet RITUAL from <https://faucet.ritualfoundation.org>
 
-## Setup
+## Run it locally
 
 ```bash
 cd hardhat
 pnpm install
-cp .env.example .env
+pnpm exec hardhat test          # 33 solidity + 2 walks
+
+cd ../web
+pnpm install
+pnpm dev                        # paper desk on :3000
+# GET /api/oracle/eth  (jq path .price)
 ```
 
 ---
