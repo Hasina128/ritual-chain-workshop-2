@@ -105,6 +105,8 @@ contract RitualPredict {
     uint256 public constant MIN_BETTING_SECONDS = 30;
     uint256 public constant MIN_RESOLVE_DELAY_SECONDS = 15;
     uint256 public constant MAX_MARKET_SECONDS = 1 days;
+    /// Dust filter so a 1-wei "bet" cannot grief the pool display.
+    uint256 public constant MIN_STAKE = 0.001 ether;
 
     // ────────────────────────────── Storage ──────────────────────────────
 
@@ -184,6 +186,9 @@ contract RitualPredict {
     error BadDuration();
     error EmptyString();
     error TransferFailed();
+    error FeedRejected();
+    error QueryRejected();
+    error DustStake();
 
     constructor(uint256 blockTimeMs_) {
         if (blockTimeMs_ == 0) revert BadDuration();
@@ -205,12 +210,52 @@ contract RitualPredict {
     function createMarket(
         NewMarket calldata p
     ) external returns (uint256 marketId) {
-        // we'll fill this up
+        if (bytes(p.question).length == 0) revert EmptyString();
+        if (!_feedAllowed(p.oracleUrl)) revert FeedRejected();
+        if (!_queryAllowed(p.jsonPath)) revert QueryRejected();
+        if (
+            p.bettingSeconds < MIN_BETTING_SECONDS ||
+            p.resolveDelaySeconds < MIN_RESOLVE_DELAY_SECONDS ||
+            p.bettingSeconds + p.resolveDelaySeconds > MAX_MARKET_SECONDS
+        ) revert BadDuration();
+
+        marketId = ++marketCount;
+        Market storage slot = _markets[marketId];
+        slot.id = marketId;
+        slot.creator = msg.sender;
+        slot.question = p.question;
+        slot.oracleUrl = p.oracleUrl;
+        slot.jsonPath = p.jsonPath;
+        slot.target = p.target;
+        slot.comparator = p.comparator;
+        (slot.closeBlock, slot.resolveBlock) = _window(
+            p.bettingSeconds,
+            p.resolveDelaySeconds
+        );
+        slot.state = MarketState.Open;
+        slot.scheduleId = _bookWake(marketId, slot.resolveBlock);
+
+        emit MarketCreated(
+            marketId,
+            msg.sender,
+            p.question,
+            slot.closeBlock,
+            slot.resolveBlock,
+            slot.scheduleId
+        );
+        emit ResolutionRuleSet(
+            marketId,
+            p.oracleUrl,
+            p.jsonPath,
+            p.target,
+            p.comparator
+        );
     }
 
     function bet(uint256 marketId, bool isYes) external payable {
         Market storage m = _market(marketId);
         if (msg.value == 0) revert ZeroStake();
+        if (msg.value < MIN_STAKE) revert DustStake();
         if (m.state != MarketState.Open || block.number >= m.closeBlock)
             revert BettingClosed();
 
@@ -237,7 +282,47 @@ contract RitualPredict {
         uint256 executionIndex,
         uint256 marketId
     ) external {
-        // we'll fill this up
+        if (msg.sender != RitualChain.SCHEDULER) revert OnlyScheduler();
+
+        Market storage slot = _markets[marketId];
+        if (slot.closeBlock == 0) return;
+        if (
+            slot.state == MarketState.Resolved ||
+            slot.state == MarketState.Invalid
+        ) return;
+        if (block.number < slot.resolveBlock) return;
+
+        uint8 n = ++slot.attempts;
+        slot.state = MarketState.Resolving;
+
+        address tee = _chooseTee(marketId, executionIndex);
+        emit ResolutionAttempted(marketId, n, tee);
+        if (tee == address(0)) {
+            _fail(slot, marketId, n, "no tee");
+            return;
+        }
+
+        (bool ok, uint256 observed, string memory why) = _pullFeed(slot, tee);
+        if (!ok) {
+            _fail(slot, marketId, n, why);
+            return;
+        }
+
+        Outcome side = _compare(observed, slot.target, slot.comparator)
+            ? Outcome.Yes
+            : Outcome.No;
+        slot.observedValue = observed;
+        slot.outcome = side;
+        emit MarketResolved(marketId, side, observed);
+
+        uint256 winners = side == Outcome.Yes ? slot.totalYes : slot.totalNo;
+        if (winners == 0) {
+            _invalidate(slot, marketId, "empty book");
+        } else {
+            slot.state = MarketState.Resolved;
+        }
+
+        try IScheduler(RitualChain.SCHEDULER).cancel(slot.scheduleId) {} catch {}
     }
 
     /// A failed oracle read is never interpreted as NO. Once the booked attempts are
@@ -373,18 +458,60 @@ contract RitualPredict {
     // ───────────────────── Ritual: oracle read path ──────────────────────
 
     /// HTTP (0x0801) → jq (0x0803), both inside this one scheduled transaction.
-    function _readOracle(
+    function _pullFeed(
         Market storage m,
         address executor
     ) private returns (bool ok, uint256 value, string memory reason) {
-        // we'll fill this up
+        bytes memory payload = abi.encode(
+            executor,
+            new bytes[](0),
+            HTTP_TTL_BLOCKS,
+            new bytes[](0),
+            bytes(""),
+            m.oracleUrl,
+            RitualChain.HTTP_GET,
+            new string[](0),
+            new string[](0),
+            bytes(""),
+            uint256(0),
+            uint8(0),
+            false
+        );
+
+        (bool sent, bytes memory raw) = RitualChain.HTTP_PRECOMPILE.call(
+            payload
+        );
+        if (!sent) return (false, 0, "http miss");
+
+        uint16 code;
+        bytes memory body;
+        string memory err;
+        try this.decodeHttpResponse(raw) returns (
+            uint16 c,
+            bytes memory b,
+            string memory e
+        ) {
+            code = c;
+            body = b;
+            err = e;
+        } catch {
+            return (false, 0, "bad envelope");
+        }
+
+        if (bytes(err).length != 0) return (false, 0, err);
+        if (code != 200) return (false, 0, "status");
+        if (body.length == 0) return (false, 0, "empty body");
+
+        (bool parsed, uint256 n) = _jqUint(m.jsonPath, string(body));
+        if (!parsed) return (false, 0, "jq");
+        return (true, n, "");
     }
 
     /**
      * Unwraps the short-running async envelope `(bytes simmedInput, bytes actualOutput)`
      * and the 5-field HTTP response inside it.
      *
-     * External so `_readOracle` can call it through `try`. Reverting on malformed input
+     * External so `_pullFeed` can call it through `try`. Reverting on malformed input
      * is exactly the signal the caller wants.
      */
     function decodeHttpResponse(
@@ -416,20 +543,97 @@ contract RitualPredict {
         return (true, abi.decode(result, (uint256)));
     }
 
-    function _pickExecutor(
+    function _chooseTee(
         uint256 marketId,
         uint256 executionIndex
     ) private view returns (address) {
-        // we'll fill this up
+        uint256 seed = uint256(
+            keccak256(
+                abi.encode(marketId, executionIndex, block.number, address(this))
+            )
+        );
+        try
+            ITEEServiceRegistry(RitualChain.TEE_SERVICE_REGISTRY)
+                .pickServiceByCapability(
+                    RitualChain.CAPABILITY_HTTP_CALL,
+                    true,
+                    seed,
+                    EXECUTOR_PROBES
+                )
+        returns (address tee, bool ok) {
+            if (!ok || tee == address(0)) return address(0);
+            return tee;
+        } catch {
+            return address(0);
+        }
     }
 
-    // ────────────────────── Ritual: scheduling ───────────────────────────
-
-    function _scheduleResolution(
+    function _bookWake(
         uint256 marketId,
         uint64 resolveBlock
     ) private returns (uint256 callId) {
-        // we'll fill this up
+        bytes memory data = abi.encodeWithSelector(
+            this.onScheduledResolve.selector,
+            uint256(0),
+            marketId
+        );
+        uint256 feeCap = block.basefee * 3;
+        if (feeCap < MIN_MAX_FEE_PER_GAS) feeCap = MIN_MAX_FEE_PER_GAS;
+
+        return
+            IScheduler(RitualChain.SCHEDULER).schedule(
+                data,
+                RESOLVE_GAS_LIMIT,
+                uint32(resolveBlock),
+                MAX_ATTEMPTS,
+                RETRY_INTERVAL_BLOCKS,
+                SCHEDULER_TTL_BLOCKS,
+                feeCap,
+                0,
+                0,
+                address(this)
+            );
+    }
+
+    function windowsFor(
+        uint256 bettingSeconds,
+        uint256 resolveDelaySeconds
+    ) external view returns (uint64 closeBlock, uint64 resolveBlock) {
+        return _window(bettingSeconds, resolveDelaySeconds);
+    }
+
+    function ruleHolds(
+        uint256 observed,
+        uint256 target,
+        Comparator comparator
+    ) external pure returns (bool) {
+        return _compare(observed, target, comparator);
+    }
+
+    function liveMarkets() external view returns (Market[] memory openOnes) {
+        uint256 total = marketCount;
+        uint256 n;
+        for (uint256 i = 1; i <= total; i++) {
+            Market memory m = getMarket(i);
+            if (
+                m.state == MarketState.Open || m.state == MarketState.Closed
+            ) n++;
+        }
+        openOnes = new Market[](n);
+        uint256 w;
+        for (uint256 i = total; i >= 1; i--) {
+            Market memory m = getMarket(i);
+            if (
+                m.state == MarketState.Open || m.state == MarketState.Closed
+            ) {
+                openOnes[w++] = m;
+            }
+            if (i == 1) break;
+        }
+    }
+
+    function purseLock() external view returns (uint256) {
+        return IRitualWallet(RitualChain.RITUAL_WALLET).lockUntil(address(this));
     }
 
     // ────────────────────────────── Helpers ──────────────────────────────
@@ -455,6 +659,69 @@ contract RitualPredict {
     ) private view returns (uint256 blocks) {
         blocks = (seconds_ * 1000) / blockTimeMs;
         if (blocks == 0) blocks = 1;
+    }
+
+    function _window(
+        uint256 bettingSeconds,
+        uint256 resolveDelaySeconds
+    ) private view returns (uint64 closeBlock, uint64 resolveBlock) {
+        closeBlock = uint64(block.number + _secondsToBlocks(bettingSeconds));
+        resolveBlock = uint64(
+            block.number +
+                _secondsToBlocks(bettingSeconds + resolveDelaySeconds)
+        );
+    }
+
+    function _feedAllowed(string memory url) private pure returns (bool) {
+        bytes memory b = bytes(url);
+        if (b.length < 12) return false;
+        bool http = _prefix(b, "http://");
+        bool https = _prefix(b, "https://");
+        if (!http && !https) return false;
+        if (_has(b, "localhost") || _has(b, "127.0.0.1") || _has(b, "0.0.0.0")) {
+            return false;
+        }
+        return true;
+    }
+
+    function _queryAllowed(string memory path) private pure returns (bool) {
+        bytes memory b = bytes(path);
+        if (b.length < 2 || b[0] != bytes1(".")) return false;
+        bool letter;
+        for (uint256 i = 1; i < b.length; i++) {
+            bytes1 c = b[i];
+            if (
+                (c >= 0x41 && c <= 0x5A) ||
+                (c >= 0x61 && c <= 0x7A)
+            ) letter = true;
+        }
+        return letter;
+    }
+
+    function _prefix(bytes memory hay, string memory needle) private pure returns (bool) {
+        bytes memory n = bytes(needle);
+        if (hay.length < n.length) return false;
+        for (uint256 i = 0; i < n.length; i++) {
+            if (hay[i] != n[i]) return false;
+        }
+        return true;
+    }
+
+    function _has(bytes memory hay, string memory needle) private pure returns (bool) {
+        bytes memory n = bytes(needle);
+        if (hay.length < n.length) return false;
+        uint256 lim = hay.length - n.length + 1;
+        for (uint256 i = 0; i < lim; i++) {
+            bool hit = true;
+            for (uint256 j = 0; j < n.length; j++) {
+                if (hay[i + j] != n[j]) {
+                    hit = false;
+                    break;
+                }
+            }
+            if (hit) return true;
+        }
+        return false;
     }
 
     function _pay(address to, uint256 amount) private {

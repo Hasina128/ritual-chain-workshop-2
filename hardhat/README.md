@@ -27,7 +27,7 @@ scripts/
 ```bash
 cp .env.example .env                            # RITUAL_PRIVATE_KEY, funded from the faucet
 
-npx hardhat test                                # 33 Solidity + 2 TypeScript tests
+npx hardhat test                                # PredictHarness solidity + desk.walk.ts
 npx hardhat test solidity                       # Solidity only
 npx hardhat build                               # compile
 

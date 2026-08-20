@@ -1,0 +1,9 @@
+.DS_Store
+hardhat/node_modules/
+hardhat/artifacts/
+hardhat/cache/
+hardhat/.env
+web/node_modules/
+web/.next/
+web/.env.local
+web/.env*.local
