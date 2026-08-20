@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #f3ead6;
+  --ink: #1c140c;
+  --rule: #c9b99a;
+  --yes: #1f6b45;
+  --no: #a31d2e;
+}
+
+html,
+body {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+body {
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 27px,
+      rgba(28, 20, 12, 0.03) 28px
+    );
+}
+
+.masthead-rule {
+  border-top: 3px solid var(--ink);
+  border-bottom: 1px solid var(--ink);
+}
